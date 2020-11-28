@@ -12,12 +12,10 @@ void thread0() {
     }
 }
 void thread1() {
-    char buf[128] = "";
+    std::string str;
     while (true) {
-        size_t len = 0;
-        rmdb.get((unsigned char *)buf, len);
-        buf[len] = 0;
-        std::cout << "I am thread1 get len:" << len << " get value:" << buf << std::endl;
+        rmdb.get(str);
+        std::cout << "I am thread1 get value:" << str << std::endl;
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 }

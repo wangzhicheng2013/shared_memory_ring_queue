@@ -3,10 +3,16 @@
 #include <sys/time.h>
 #include <time.h>
 #include <errno.h>
+#include <string>
 #include "shared_memory_com.hpp"
 namespace shmd_mdb {
 const static key_t G_MDB_SHM_KEY = 0x17804;
 const static size_t G_MDB_VAL_LEN = 50 * 1024 * 1024;   // 50M
+struct shared_info {
+    unsigned int last_reading_pos = 0;
+    unsigned int currrent_writing_pos = 0;
+    unsigned int currrent_reading_pos = 0;
+};
 class ring_mdb {
 public:
     ring_mdb() = default;
@@ -22,22 +28,28 @@ public:
             return false;
         }
         queue_len_ = shm_size;
+        size_t total_shm_size = queue_len_ + sizeof(shared_info);
         // remove used shm
         size_t size = shared_memory_com::get_shm_size_by_key(shm_key);
-        if (size > 0 && size != queue_len_) {
+        if (size > 0 && size != total_shm_size) {
             shared_memory_com::remove_shm_by_key(shm_key);
         }
-        shm_addr_ = shared_memory_com::create_shm(shm_key, queue_len_);
+        shm_addr_ = shared_memory_com::create_shm(shm_key, total_shm_size);
         if (!shm_addr_) {
             return false;
         }
-        ring_queue_ = static_cast<unsigned char *>(shm_addr_);
-        if (!ring_queue_) {
-            return false;
-        }
-        memset(ring_queue_, 0, queue_len_);
-        last_reading_pos_ = queue_len_ - sizeof(size_t);
+        ring_queue_ = static_cast<unsigned char *>(shm_addr_) + sizeof(shared_info);
+        memset(shm_addr_, 0, total_shm_size);
+        init_shm_pos();
         return true;
+    }
+    inline void init_shm_pos() {
+        currrent_reading_pos_ = (unsigned int *)(&((shared_info *)shm_addr_)->currrent_reading_pos);
+        currrent_writing_pos_ = (unsigned int *)(&((shared_info *)shm_addr_)->currrent_writing_pos);
+        last_reading_pos_ = (unsigned int *)(&((shared_info *)shm_addr_)->last_reading_pos);
+        *currrent_reading_pos_ = 0;
+        *currrent_writing_pos_ = 0;
+        *last_reading_pos_ = queue_len_ - sizeof(size_t);
     }
     inline void set_max_mdb_val_len(size_t len) {
         max_mdb_val_len_ = len;
@@ -51,32 +63,32 @@ public:
         if (total_len >= queue_len_) {
             return false;
         }
-        if (currrent_writing_pos_ == last_reading_pos_) {
+        if (*currrent_writing_pos_ == *last_reading_pos_) {
             return false;
         }
-        if (currrent_writing_pos_ < last_reading_pos_) {
-            size_t free_len = last_reading_pos_ - currrent_writing_pos_;
+        if (*currrent_writing_pos_ < *last_reading_pos_) {
+            size_t free_len = *last_reading_pos_ - *currrent_writing_pos_;
             if (free_len < total_len) {   // mdb is full
                 return false;
             }
-            memcpy(ring_queue_ + currrent_writing_pos_, &len, len_size);   // first copy len
-            memcpy(ring_queue_ + currrent_writing_pos_ + len_size, value, len);    // then copy value
+            memcpy(ring_queue_ + *currrent_writing_pos_, &len, len_size);   // first copy len
+            memcpy(ring_queue_ + *currrent_writing_pos_ + len_size, value, len);    // then copy value
         }
         else  {
-            if (queue_len_ - currrent_writing_pos_ >= total_len) {     // there is certain space after current writing pos
-                memcpy(ring_queue_ + currrent_writing_pos_, &len, len_size);
-                memcpy(ring_queue_ + currrent_writing_pos_ + len_size, value, len);
+            if (queue_len_ - *currrent_writing_pos_ >= total_len) {     // there is certain space after current writing pos
+                memcpy(ring_queue_ + *currrent_writing_pos_, &len, len_size);
+                memcpy(ring_queue_ + *currrent_writing_pos_ + len_size, value, len);
             }
-            else if (last_reading_pos_ + queue_len_ - currrent_writing_pos_ >= total_len) {   // copy data to last space and first space of queue
-                if (queue_len_ - currrent_writing_pos_ >= len_size) {  // there is certain space for len
-                    memcpy(ring_queue_ + currrent_writing_pos_, &len, len_size);       // first copy len
-                    size_t tmp_len = queue_len_ - currrent_writing_pos_ - len_size;    // copy last space of value
-                    memcpy(ring_queue_ + currrent_writing_pos_ + len_size, value, tmp_len);
+            else if (*last_reading_pos_ + queue_len_ - *currrent_writing_pos_ >= total_len) {   // copy data to last space and first space of queue
+                if (queue_len_ - *currrent_writing_pos_ >= len_size) {  // there is certain space for len
+                    memcpy(ring_queue_ + *currrent_writing_pos_, &len, len_size);       // first copy len
+                    size_t tmp_len = queue_len_ - *currrent_writing_pos_ - len_size;    // copy last space of value
+                    memcpy(ring_queue_ + *currrent_writing_pos_ + len_size, value, tmp_len);
                     memcpy(ring_queue_, value + tmp_len, len - tmp_len);
                 }
                 else {
-                    size_t tmp_len = queue_len_ - currrent_writing_pos_;   // copy partial space of len
-                    memcpy(ring_queue_ + currrent_writing_pos_, &len, tmp_len);
+                    size_t tmp_len = queue_len_ - *currrent_writing_pos_;   // copy partial space of len
+                    memcpy(ring_queue_ + *currrent_writing_pos_, &len, tmp_len);
                     memcpy(ring_queue_, (char *)&len + tmp_len, len_size - tmp_len);
                     memcpy(ring_queue_ + len_size - tmp_len, value, len);
                 }
@@ -85,17 +97,22 @@ public:
                 return false;
             }
         }
-        currrent_writing_pos_ = (currrent_writing_pos_ + total_len) % queue_len_;
+        *currrent_writing_pos_ = (*currrent_writing_pos_ + total_len) % queue_len_;
     }
-    bool get(unsigned char *value, size_t &len) {
-        if (currrent_reading_pos_ == currrent_writing_pos_) {
+    bool get(std::string &str) {
+        if (*currrent_reading_pos_ == *currrent_writing_pos_) {
             return false;
         }
-        get_len(currrent_reading_pos_, len);
+        size_t len = 0;
+        get_len(*currrent_reading_pos_, len);
         if (!len) {
             return false;
         }
-        size_t read_pos = (currrent_reading_pos_ + sizeof(len)) % queue_len_;  // the pos for reading value
+        unsigned char *value = (unsigned char *)malloc(len * sizeof(unsigned char));
+        if (!value) {
+            return false;
+        }
+        size_t read_pos = (*currrent_reading_pos_ + sizeof(len)) % queue_len_;  // the pos for reading value
         size_t tmp_len = queue_len_ - read_pos; 
         if (len <= tmp_len) {   //  can hold the full space for value
             memcpy(value, ring_queue_ + read_pos, len);
@@ -104,9 +121,11 @@ public:
             memcpy(value, ring_queue_ + read_pos, tmp_len);  // copy the last space from read pos of queue
             memcpy(value + tmp_len, ring_queue_, len - tmp_len);    // copy from begining of queue to value
         }
-        size_t tmp_pos = currrent_reading_pos_;
-        currrent_reading_pos_ = (currrent_reading_pos_ + len + sizeof(len)) % queue_len_;
-        last_reading_pos_ = tmp_pos;
+        size_t tmp_pos = *currrent_reading_pos_;
+        *currrent_reading_pos_ = (*currrent_reading_pos_ + len + sizeof(len)) % queue_len_;
+        *last_reading_pos_ = tmp_pos;
+        str.assign((const char *)value, len);
+        free(value);
         return true;
     }
 private:
@@ -126,8 +145,8 @@ private:
     unsigned char *ring_queue_ = nullptr;
     size_t queue_len_ = 0;
 
-    unsigned int last_reading_pos_ = 0;
-    unsigned int currrent_writing_pos_ = 0;
-    unsigned int currrent_reading_pos_ = 0;
+    unsigned int *last_reading_pos_ = nullptr;
+    unsigned int *currrent_writing_pos_ = nullptr;
+    unsigned int *currrent_reading_pos_ = nullptr;
 };
 }
